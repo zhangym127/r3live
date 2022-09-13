@@ -566,6 +566,8 @@ int R3LIVE::service_LIO_update()
             pca_time = 0;
             svd_time = 0;
             t0 = omp_get_wtime();
+
+            /* 【关键步骤1】：完成点云的帧内校正，通过IMU的积分获得位姿等状态变量的先验值 */
             p_imu->Process( Measures, g_lio_state, feats_undistort );
 
             g_camera_lidar_queue.g_noise_cov_acc = p_imu->cov_acc;
@@ -598,9 +600,14 @@ int R3LIVE::service_LIO_update()
                       << g_lio_state.vel_end.transpose() << " " << g_lio_state.bias_g.transpose() << " " << g_lio_state.bias_a.transpose()
                       << std::endl;
 #endif
+            /*滚动更新当前的Cube矩阵地图，使当前帧所在位置挪到地图中心*/
             lasermap_fov_segment();
+
+            /* 【关键步骤2】：对去畸变的点云降采样 */
             downSizeFilterSurf.setInputCloud( feats_undistort );
             downSizeFilterSurf.filter( *feats_down );
+
+            /* 【关键操作】：将第一帧点云添加到ikdtree地图中，作为初始的地图 */
             // cout <<"Preprocess cost time: " << tim.toc("Preprocess") << endl;
             /*** initialize the map kdtree ***/
             if ( ( feats_down->points.size() > 1 ) && ( ikdtree.Root_Node == nullptr ) )
@@ -631,6 +638,7 @@ int R3LIVE::service_LIO_update()
             {
                 t1 = omp_get_wtime();
 
+                /* 发布当前的地图点云 */
                 if ( m_if_publish_feature_map )
                 {
                     PointVector().swap( ikdtree.PCL_Storage );
@@ -657,6 +665,8 @@ int R3LIVE::service_LIO_update()
                 deltaT = 0.0;
                 t2 = omp_get_wtime();
                 double maximum_pt_range = 0.0;
+
+                /* 进行5次迭代优化 */
                 // cout <<"Preprocess 2 cost time: " << tim.toc("Preprocess") << endl;
                 for ( iterCount = 0; iterCount < NUM_MAX_ITERATIONS; iterCount++ )
                 {
@@ -665,22 +675,27 @@ int R3LIVE::service_LIO_update()
                     laserCloudOri->clear();
                     coeffSel->clear();
 
+                    /* 遍历降采样后的当前扫描点云，可以设置采样率m_lio_update_point_step，默认是1，即不做下采样 */
                     /** closest surface search and residual computation **/
                     for ( int i = 0; i < feats_down_size; i += m_lio_update_point_step )
                     {
                         double     search_start = omp_get_wtime();
                         PointType &pointOri_tmpt = feats_down->points[ i ];
+                        /* 计算当前点到坐标原点的距离 */
                         double     ori_pt_dis =
                             sqrt( pointOri_tmpt.x * pointOri_tmpt.x + pointOri_tmpt.y * pointOri_tmpt.y + pointOri_tmpt.z * pointOri_tmpt.z );
+                        /* 记录到坐标原点的最大点距 */
                         maximum_pt_range = std::max( ori_pt_dis, maximum_pt_range );
                         PointType &pointSel_tmpt = feats_down_updated->points[ i ];
 
+                        /* 当前点转到世界坐标系 */
                         /* transform to world frame */
                         pointBodyToWorld( &pointOri_tmpt, &pointSel_tmpt );
                         std::vector< float > pointSearchSqDis_surf;
 
                         auto &points_near = Nearest_Points[ i ];
 
+                        /* 在Map kdtree中搜索最近的5个点，要求距离当前点必须在m_maximum_pt_kdtree_dis以内，默认值是0.5米 */
                         if ( iterCount == 0 || rematch_en )
                         {
                             point_selected_surf[ i ] = true;
@@ -706,6 +721,7 @@ int R3LIVE::service_LIO_update()
                         cv::Mat matB0( NUM_MATCH_POINTS, 1, CV_32F, cv::Scalar::all( -1 ) );
                         cv::Mat matX0( NUM_MATCH_POINTS, 1, CV_32F, cv::Scalar::all( 0 ) );
 
+                        /* 构造矩阵A */
                         for ( int j = 0; j < NUM_MATCH_POINTS; j++ )
                         {
                             matA0.at< float >( j, 0 ) = points_near[ j ].x;
@@ -713,19 +729,23 @@ int R3LIVE::service_LIO_update()
                             matA0.at< float >( j, 2 ) = points_near[ j ].z;
                         }
 
+                        /* QR分解求解Ax=b，即ax+by+cz+d=0，即五个点所在的平面方程，其中matX0(a,b,c)是平面的法向量，d设置为1 */
                         cv::solve( matA0, matB0, matX0, cv::DECOMP_QR ); // TODO
 
+                        /* 取得平面系数(a,b,c,d) */
                         float pa = matX0.at< float >( 0, 0 );
                         float pb = matX0.at< float >( 1, 0 );
                         float pc = matX0.at< float >( 2, 0 );
                         float pd = 1;
 
+                        /* 求解的时候就是按照d=1求解的，因此包括d在内的四个系数统一归一化 */
                         float ps = sqrt( pa * pa + pb * pb + pc * pc );
                         pa /= ps;
                         pb /= ps;
                         pc /= ps;
                         pd /= ps;
 
+                        /* 将5个点带入平面方程，确认5个点都在平面上，m_planar_check_dis就是阈值，0.05或0.1米 */
                         bool planeValid = true;
                         for ( int j = 0; j < NUM_MATCH_POINTS; j++ )
                         {
@@ -733,6 +753,8 @@ int R3LIVE::service_LIO_update()
                             if ( fabs( pa * points_near[ j ].x + pb * points_near[ j ].y + pc * points_near[ j ].z + pd ) >
                                  m_planar_check_dis ) // Raw 0.05
                             {
+                                /* 如果五个点不在一个平面上，则除非当前点到原点的距离接近最大值，或者超过500米，否则认定是无效平面点 */
+                                /* 换句话说，如果当前点足够远，则放宽对平面点的容忍度 */
                                 // ANCHOR - Far distance pt processing
                                 if ( ori_pt_dis < maximum_pt_range * 0.90 || ( ori_pt_dis < m_long_rang_pt_dis ) )
                                 // if(1)
@@ -744,12 +766,29 @@ int R3LIVE::service_LIO_update()
                             }
                         }
 
+                        /* 地图中的5个最近点共面 */
                         if ( planeValid )
                         {
+                            /** 
+                             * 下面将当前点的坐标带入平面方程，计算点到平面的距离，即残差
+                             * 由于前面对平面系数(a,b,c)进行了归一化，因此点到平面的距离公式的分母（平面法向量的模）等于1，公式简化为：
+                             *         ax+by+cz+d
+                             * dist = ------------ = ax+by+cz+d
+                             *         √a^2+b^2+c^
+                             * 因此下面的pd2就是当前点到平面的距离。
+                             */
                             float pd2 = pa * pointSel_tmpt.x + pb * pointSel_tmpt.y + pc * pointSel_tmpt.z + pd;
+
+                            /**
+                             * 计算当前点到平面距离的置信度s
+                             * 要求当前点到雷达的距离至少是到平面距离的10倍以上，也就是5米以上
+                             * 但是这个置信度【没有使用】
+                             */
                             float s = 1 - 0.9 * fabs( pd2 ) /
                                               sqrt( sqrt( pointSel_tmpt.x * pointSel_tmpt.x + pointSel_tmpt.y * pointSel_tmpt.y +
                                                           pointSel_tmpt.z * pointSel_tmpt.z ) );
+
+                            /* 如果当前点到平面的距离小于m_maximum_res_dis（0.3米），则计算残差 */
                             // ANCHOR -  Point to plane distance
                             double acc_distance = ( ori_pt_dis < m_long_rang_pt_dis ) ? m_maximum_res_dis : 1.0;
                             if ( pd2 < acc_distance )
@@ -760,12 +799,12 @@ int R3LIVE::service_LIO_update()
                                 //     res_last[i] = 0.0;
                                 //     continue;
                                 // }
-                                point_selected_surf[ i ] = true;
-                                coeffSel_tmpt->points[ i ].x = pa;
+                                point_selected_surf[ i ] = true;        //当前点有匹配的平面
+                                coeffSel_tmpt->points[ i ].x = pa;      //平面法向量
                                 coeffSel_tmpt->points[ i ].y = pb;
                                 coeffSel_tmpt->points[ i ].z = pc;
-                                coeffSel_tmpt->points[ i ].intensity = pd2;
-                                res_last[ i ] = std::abs( pd2 );
+                                coeffSel_tmpt->points[ i ].intensity = pd2; //当前点到平面的距离
+                                res_last[ i ] = std::abs( pd2 );        //当前点到平面距离的绝对值，即残差
                             }
                             else
                             {
@@ -775,45 +814,66 @@ int R3LIVE::service_LIO_update()
                         pca_time += omp_get_wtime() - pca_start;
                     }
                     tim.tic( "Stack" );
+
+                    /* 累计总的残差 */
                     double total_residual = 0.0;
+                    /* 有效的特征点数量 */
                     laserCloudSelNum = 0;
 
+                    /* 保存有效的特征点，对应平面法向量，并统计数量 */
                     for ( int i = 0; i < coeffSel_tmpt->points.size(); i++ )
                     {
                         if ( point_selected_surf[ i ] && ( res_last[ i ] <= 2.0 ) )
                         {
+                            /* 记录有效特征点坐标，注意这里用的【雷达坐标系】 */
                             laserCloudOri->push_back( feats_down->points[ i ] );
+                            /* 记录有效特征点到平面的法向量 */
                             coeffSel->push_back( coeffSel_tmpt->points[ i ] );
+                            /* 累计总的残差 */
                             total_residual += res_last[ i ];
+                            /* 记录有效的特征点数量 */
                             laserCloudSelNum++;
                         }
                     }
+                    /* 计算残差的均值 */
                     res_mean_last = total_residual / laserCloudSelNum;
 
+                    /* 计算匹配的总耗时 */
                     match_time += omp_get_wtime() - match_start;
+                    /* 记录优化的起始时间点 */
                     solve_start = omp_get_wtime();
 
+                    /* 计算测量矩阵H和测量向量 */
                     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
                     Eigen::MatrixXd Hsub( laserCloudSelNum, 6 );
                     Eigen::VectorXd meas_vec( laserCloudSelNum );
                     Hsub.setZero();
 
+                    /* 遍历特征点 */
                     for ( int i = 0; i < laserCloudSelNum; i++ )
                     {
                         const PointType &laser_p = laserCloudOri->points[ i ];
                         Eigen::Vector3d  point_this( laser_p.x, laser_p.y, laser_p.z );
                         point_this += Lidar_offset_to_IMU;
                         Eigen::Matrix3d point_crossmat;
+
+                        /* 取得当前点的反对称矩阵，该点是【雷达坐标系】 */
                         point_crossmat << SKEW_SYM_MATRIX( point_this );
 
+                        /* 取得与最近点匹配平面的法向量 */
                         /*** get the normal vector of closest surface/corner ***/
                         const PointType &norm_p = coeffSel->points[ i ];
                         Eigen::Vector3d  norm_vec( norm_p.x, norm_p.y, norm_p.z );
 
+                        /**
+                         * 构造观测矩阵矩阵H：
+                         * 依据ESKF的定义构造观测矩阵Hsub
+                         */
                         /*** calculate the Measuremnt Jacobian matrix H ***/
                         Eigen::Vector3d A( point_crossmat * g_lio_state.rot_end.transpose() * norm_vec );
                         Hsub.row( i ) << VEC_FROM_ARRAY( A ), norm_p.x, norm_p.y, norm_p.z;
 
+                        /* 测量值：到最近平面的距离 */
                         /*** Measuremnt: distance to the closest surface/corner ***/
                         meas_vec( i ) = -norm_p.intensity;
                     }
@@ -822,6 +882,7 @@ int R3LIVE::service_LIO_update()
                     Eigen::Matrix< double, DIM_OF_STATES, 1 > solution;
                     Eigen::MatrixXd                           K( DIM_OF_STATES, laserCloudSelNum );
 
+                    /***** 下面开始IEKF更新 ******/
                     /*** Iterative Kalman Filter Update ***/
                     if ( !flg_EKF_inited )
                     {
@@ -831,6 +892,22 @@ int R3LIVE::service_LIO_update()
                     }
                     else
                     {
+                        /**
+                         * 计算EKF的增益K
+                         *             PH^T              H^T
+                         * 增益K = ------------- = ---------------
+                         *           HPH^T + R        H^TH + R/P
+                         * 
+                         * g_lio_state.cov：即EKF的协方差矩阵P
+                         * LASER_POINT_COV：即EKF的测量噪声R
+                         * 
+                         * ( g_lio_state.cov / LASER_POINT_COV ).inverse()
+                         *          即R/P
+                         * H_T_H
+                         *          即H^TH
+                         * H_T_H + ( g_lio_state.cov / LASER_POINT_COV ).inverse()
+                         *          即H^TH + R/P
+                         */
                         // cout << ANSI_COLOR_RED_BOLD << "Run EKF uph" << ANSI_COLOR_RESET << endl;
                         auto &&Hsub_T = Hsub.transpose();
                         H_T_H.block< 6, 6 >( 0, 0 ) = Hsub_T * Hsub;
@@ -838,6 +915,38 @@ int R3LIVE::service_LIO_update()
                             ( H_T_H + ( g_lio_state.cov / LASER_POINT_COV ).inverse() ).inverse();
                         K = K_1.block< DIM_OF_STATES, 6 >( 0, 0 ) * Hsub_T;
 
+                        /**
+                         * vec记录状态变量的先验和后验之差，state_propagate记录的是先验值，g_lio_state是后验值
+                         * vec的长度29，前18项LIO相关，后11项VIO相关
+                         * 前18项如下：
+                         * [0~2]：姿态，采用李代数的方式描述
+                         * [3~5]：位置
+                         * [6~8]：速度
+                         * [9~11]：角速度偏差
+                         * [12~14]：加速度偏差
+                         * [15~17]：重力加速度
+                         * 
+                         * vec.block< 6, 1 >( 0, 0 )取vec的前六项，即：
+                         * [0~2]：姿态之差，采用李代数的方式描述
+                         * [3~5]：位置之差
+                         * 
+                         * Hsub的前三列是当前点向量与平面法向量的垂线，后三列是平面法向量（单位向量）
+                         * Hsub*vec.block< 6, 1 >( 0, 0 )表示：
+                         *  1. 用垂线向量乘以姿态的李代数，似乎是迭代过程中因旋转导致的修正量，对下面的投影长度进行修正
+                         *  2. 用平面法向量（单位向量）点乘位置之差，即取得位置之差在平面法向量上的投影长度
+                         * 
+                         * meas_vec：即EKF的观测值或测量值z，在测量空间
+                         * vec：     即EKF状态变量预测值x，在状态空间
+                         * Hsub：    即EKF的测量矩阵H，负责把预测值从状态空间转到测量空间
+                         * Hsub * vec.block< 6, 1 >( 0, 0 )：
+                         *           即EKF的Hx，表示把预测值vec从状态空间转到测量空间
+                         * meas_vec - Hsub * vec.block< 6, 1 >( 0, 0 )：
+                         *           即EKF的残差y=z-Hx
+                         * solution = K * ( meas_vec - Hsub * vec.block< 6, 1 >( 0, 0 ) )：
+                         *           即EKF的Ky，负责调节残差的比例，并且把残差y转回状态空间
+                         * g_lio_state = state_propagate + solution：
+                         *           即EKF的x=x+Ky，完成状态变量的更新
+                         */
                         auto vec = state_propagate - g_lio_state;
                         solution = K * ( meas_vec - Hsub * vec.block< 6, 1 >( 0, 0 ) );
                         // double speed_delta = solution.block( 0, 6, 3, 1 ).norm();
@@ -849,6 +958,8 @@ int R3LIVE::service_LIO_update()
                         g_lio_state = state_propagate + solution;
                         print_dash_board();
                         // cout << ANSI_COLOR_RED_BOLD << "Run EKF uph, vec = " << vec.head<9>().transpose() << ANSI_COLOR_RESET << endl;
+
+                        /* 检查是否收敛，判断条件是此次迭代相对于上一次的姿态变化量小于0.01度，并且位置变化量小于0.015cm */
                         rot_add = solution.block< 3, 1 >( 0, 0 );
                         t_add = solution.block< 3, 1 >( 3, 0 );
                         flg_EKF_converged = false;
@@ -857,6 +968,7 @@ int R3LIVE::service_LIO_update()
                             flg_EKF_converged = true;
                         }
 
+                        /* 记录此次迭代的姿态和位置变化量 */
                         deltaR = rot_add.norm() * 57.3;
                         deltaT = t_add.norm() * 100;
                     }
@@ -874,12 +986,18 @@ int R3LIVE::service_LIO_update()
                         rematch_num++;
                     }
 
+                    /* 判断迭代优化是否达到目标 */
                     /*** Convergence Judgements and Covariance Update ***/
                     // if (rematch_num >= 10 || (iterCount == NUM_MAX_ITERATIONS - 1))
                     if ( rematch_num >= 2 || ( iterCount == NUM_MAX_ITERATIONS - 1 ) ) // Fast lio ori version.
                     {
                         if ( flg_EKF_inited )
                         {
+                            /**
+                             * 更新EKF的协方差矩阵P
+                             * 
+                             *    P = (I - KH)P 
+                             */
                             /*** Covariance Update ***/
                             G.block< DIM_OF_STATES, 6 >( 0, 0 ) = K * Hsub;
                             g_lio_state.cov = ( I_STATE - G ) * g_lio_state.cov;
@@ -901,12 +1019,14 @@ int R3LIVE::service_LIO_update()
 
                 t3 = omp_get_wtime();
 
+                /* 下面开始将当前帧的点添加到Map kdtree中 */
                 /*** add new frame points to map ikdtree ***/
                 PointVector points_history;
                 ikdtree.acquire_removed_points( points_history );
 
                 memset( cube_updated, 0, sizeof( cube_updated ) );
 
+                /* 下面建立了一个类似于LIO-Livox的滚动Cube矩阵地图featsArray，但是似乎并没有使用，使用的还是ikdtree */
                 for ( int i = 0; i < points_history.size(); i++ )
                 {
                     PointType &pointSel = points_history[ i ];
@@ -929,6 +1049,7 @@ int R3LIVE::service_LIO_update()
                     }
                 }
 
+                /* 将当前帧点云转换到地图系后添加到ikdtree中 */
                 for ( int i = 0; i < feats_down_size; i++ )
                 {
                     /* transform to world frame */

@@ -65,7 +65,7 @@ Follow this [livox_ros_driver Installation](https://github.com/Livox-SDK/livox_r
 
 ### 3.3 **CGAL** and **pcl_viewer** (optional)
 ```
-sudo apt-get install libcgal-dev pcl-tools
+sudo apt-get install libcgal-dev libcgal-qt5-11 pcl-tools
 ```
 ### 3.4 **OpenCV >= 3.3**
 You can use the following command to check your OpenCV version, **if your openCV version lower than OpenCV-3.3**, we recommend you to update your you openCV version if you meet errors in complying our codes. Otherwise, skip this step ^_^
