@@ -772,9 +772,9 @@ int R3LIVE::service_LIO_update()
                             /** 
                              * 下面将当前点的坐标带入平面方程，计算点到平面的距离，即残差
                              * 由于前面对平面系数(a,b,c)进行了归一化，因此点到平面的距离公式的分母（平面法向量的模）等于1，公式简化为：
-                             *         ax+by+cz+d
-                             * dist = ------------ = ax+by+cz+d
-                             *         √a^2+b^2+c^
+                             *          ax+by+cz+d
+                             * dist = -------------- = ax+by+cz+d
+                             *         √a^2+b^2+c^2
                              * 因此下面的pd2就是当前点到平面的距离。
                              */
                             float pd2 = pa * pointSel_tmpt.x + pb * pointSel_tmpt.y + pc * pointSel_tmpt.z + pd;
